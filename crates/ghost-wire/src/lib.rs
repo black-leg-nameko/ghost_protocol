@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod framing;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GHLO {
 	pub ver: u64,
