@@ -7,6 +7,7 @@ use ghost_core::types::Epoch;
 use ghost_core::aead::AeadKey;
 use ghost_wire::{GHLO, ROTATE};
 use ghost_wire::framing::{AeadFramer, NonceMode};
+use ghost_wire::router::{encode_response, Router};
 use rand::RngCore;
 use time::OffsetDateTime;
 
@@ -101,6 +102,38 @@ fn main() {
 	let opened = framer.open(&frame).expect("open frame");
 	println!("AEAD frame roundtrip ok: {}", opened == rotate_bytes);
 	println!("AEAD frame size: {} bytes (payload {} + header {})", frame.len(), rotate_bytes.len(), ghost_wire::framing::HEADER_LEN);
+
+	// === Minimal routing demo ===
+	let mut router = Router::new();
+	// Respond to GHLO with a simple GACK-like message
+	let responder_pk = ghost_new.keypair.public.compress().to_bytes().to_vec();
+	let responder_nonce = nonce.to_vec();
+	router.on_ghlo(move |msg| {
+		let reply = ghost_wire::GACK {
+			e: msg.e,
+			pk: responder_pk.clone(),
+			nonce: responder_nonce.clone(),
+			kex: eph_b.public.as_bytes().to_vec(),
+			mac: vec![],
+		};
+		encode_response(&reply).map(Some)
+	});
+	// Acknowledge ROTATE
+	router.on_rotate(|msg| {
+		let ack = ghost_wire::RACK {
+			e_new: msg.e_new,
+			ack: true,
+			note: Some("ok".to_string()),
+		};
+		encode_response(&ack).map(Some)
+	});
+
+	// Route GHLO
+	let ghlo_routed = router.route(&ghlo_bytes).expect("route GHLO").expect("reply");
+	println!("Router produced GACK ({} bytes) from GHLO", ghlo_routed.len());
+	// Route ROTATE
+	let rotate_routed = router.route(&rotate_bytes).expect("route ROTATE").expect("reply");
+	println!("Router produced RACK ({} bytes) from ROTATE", rotate_routed.len());
 }
 
 
