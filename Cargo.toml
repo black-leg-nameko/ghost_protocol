@@ -1,0 +1,9 @@
+[workspace]
+members = [
+	"crates/ghost-core",
+	"crates/ghost-wire",
+	"crates/ghost-node",
+]
+resolver = "2"
+
+
