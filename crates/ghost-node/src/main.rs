@@ -5,9 +5,11 @@ use ghost_core::kex::{X25519Keypair, dh_shared, derive_session_key};
 use ghost_core::transcript::Transcript;
 use ghost_core::types::Epoch;
 use ghost_core::aead::AeadKey;
+use ghost_core::pow::{solve_pow, verify_pow, PowAlgo};
 use ghost_wire::{GHLO, ROTATE};
 use ghost_wire::framing::{AeadFramer, NonceMode};
 use ghost_wire::router::{encode_response, Router};
+use ghost_wire::transport::UdpTransport;
 use rand::RngCore;
 use time::OffsetDateTime;
 
@@ -45,6 +47,11 @@ fn main() {
 		opts: Default::default(),
 	};
 	let ghlo_bytes = ghost_wire::to_cbor_bytes(&ghlo).expect("serialize GHLO");
+	// === PoW demo (placeholder → implemented): compute a small PoW over GHLO bytes ===
+	let pow_salt = &nonce; // reuse GHLO nonce as salt
+	let pow = solve_pow(PowAlgo::Sha512_256, 16, &ghlo_bytes, pow_salt);
+	let pow_ok = verify_pow(&pow, &ghlo_bytes, pow_salt);
+	println!("PoW over GHLO verified: {} (difficulty {} bits, nonce={})", pow_ok, pow.difficulty_bits, pow.nonce);
 	// Responder generates its ephemeral and replies with GACK (not defined as struct here; reuse GHLO shape for demo or bytes)
 	let eph_b = X25519Keypair::generate();
 	// Build a fake GACK-like payload carrying responder kex pubkey and nonce
@@ -102,6 +109,15 @@ fn main() {
 	let opened = framer.open(&frame).expect("open frame");
 	println!("AEAD frame roundtrip ok: {}", opened == rotate_bytes);
 	println!("AEAD frame size: {} bytes (payload {} + header {})", frame.len(), rotate_bytes.len(), ghost_wire::framing::HEADER_LEN);
+
+	// === Minimal transport demo (UDP loopback) ===
+	let udp = UdpTransport::bind("127.0.0.1:0").expect("bind udp");
+	let addr = udp.local_addr().expect("local addr");
+	let _sent = udp.send_to(&frame, addr).expect("udp send_to self");
+	if let Ok((rx, _peer)) = udp.recv() {
+		let opened2 = framer.open(&rx).expect("open frame via UDP");
+		println!("UDP frame roundtrip ok: {}", opened2 == rotate_bytes);
+	}
 
 	// === Minimal routing demo ===
 	let mut router = Router::new();
