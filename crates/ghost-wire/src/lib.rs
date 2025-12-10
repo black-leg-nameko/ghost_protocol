@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub mod framing;
+pub mod router;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GHLO {

@@ -190,6 +190,8 @@ dependencies = [
 name = "ghost-wire"
 version = "0.1.0"
 dependencies = [
+ "ghost-core",
+ "rand",
  "serde",
  "serde_bytes",
  "serde_cbor",
