@@ -1,6 +1,8 @@
 use ghost_core::dv_schnorr::{prove_rotate, verify_rotate};
 use ghost_core::keys::{address_for, Ghost};
 use ghost_core::kdf::{hkdf_sha512};
+use ghost_core::kex::{X25519Keypair, dh_shared, derive_session_key};
+use ghost_core::transcript::Transcript;
 use ghost_core::types::Epoch;
 use ghost_wire::{GHLO, ROTATE};
 use rand::RngCore;
@@ -21,15 +23,43 @@ fn main() {
 	let ghost_old = Ghost::generate(e_old);
 	let ghost_new = Ghost::generate(e_new);
 
-	// Simulate a session key and derive dvk (normally from X25519 DH + transcript)
-	let mut ss = [0u8; 32];
-	rand::thread_rng().fill_bytes(&mut ss);
-	let transcript = b"demo-transcript";
-	let k_s = hkdf_sha512(&ss, b"sess", transcript, 32);
+	// === KEX + Transcript binding demo ===
+	// Initiator generates ephemeral X25519 and sends GHLO with its kex pubkey
+	let eph_a = X25519Keypair::generate();
 	let mut id_context = Vec::new();
 	id_context.extend_from_slice(&ghost_old.keypair.public.compress().to_bytes());
 	id_context.extend_from_slice(&ghost_new.keypair.public.compress().to_bytes());
 	id_context.extend_from_slice(&e_old.to_be_bytes());
+	let mut nonce = [0u8; 24];
+	rand::thread_rng().fill_bytes(&mut nonce);
+	let ghlo = GHLO {
+		ver: 1,
+		e: e_old,
+		pk: ghost_old.keypair.public.compress().to_bytes().to_vec(),
+		nonce: nonce.to_vec(),
+		kex: eph_a.public.as_bytes().to_vec(),
+		suite: 1,
+		opts: Default::default(),
+	};
+	let ghlo_bytes = ghost_wire::to_cbor_bytes(&ghlo).expect("serialize GHLO");
+	// Responder generates its ephemeral and replies with GACK (not defined as struct here; reuse GHLO shape for demo or bytes)
+	let eph_b = X25519Keypair::generate();
+	// Build a fake GACK-like payload carrying responder kex pubkey and nonce
+	let gack_like = ghost_wire::GACK {
+		e: e_old,
+		pk: ghost_new.keypair.public.compress().to_bytes().to_vec(),
+		nonce: nonce.to_vec(),
+		kex: eph_b.public.as_bytes().to_vec(),
+		mac: vec![], // placeholder
+	};
+	let gack_bytes = ghost_wire::to_cbor_bytes(&gack_like).expect("serialize GACK");
+	// Both sides compute DH and bind transcript (GHLO || GACK) into the session key
+	let ss_a = dh_shared(eph_a.secret, &eph_b.public);
+	let mut tr = Transcript::new();
+	tr.append(b"GHLO", &ghlo_bytes);
+	tr.append(b"GACK", &gack_bytes);
+	let tr_hash = tr.finalize();
+	let k_s = derive_session_key(&ss_a, &tr_hash);
 	let dvk = hkdf_sha512(&k_s, b"dvk", &id_context, 32);
 
 	// Create DV-Schnorr rotate proof
@@ -39,20 +69,8 @@ fn main() {
 	let ok = verify_rotate(&dvk, &proof);
 	println!("Rotate proof verified: {}", ok);
 
-	// Create a GHLO message example
-	let mut nonce = [0u8; 24];
-	rand::thread_rng().fill_bytes(&mut nonce);
-	let ghlo = GHLO {
-		ver: 1,
-		e: e_old,
-		pk: ghost_old.keypair.public.compress().to_bytes().to_vec(),
-		nonce: nonce.to_vec(),
-		kex: vec![],  // Placeholder: would include X25519 ephemeral public key
-		suite: 1,     // Placeholder suite identifier
-		opts: Default::default(),
-	};
-	let bytes = ghost_wire::to_cbor_bytes(&ghlo).expect("serialize GHLO");
-	println!("GHLO (CBOR, {} bytes)", bytes.len());
+	println!("GHLO (CBOR, {} bytes)", ghlo_bytes.len());
+	println!("GACK (CBOR, {} bytes)", gack_bytes.len());
 
 	// Build a ROTATE message from proof for wire
 	let rotate_msg = ROTATE {
