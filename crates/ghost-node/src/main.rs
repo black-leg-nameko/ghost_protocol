@@ -4,7 +4,9 @@ use ghost_core::kdf::{hkdf_sha512};
 use ghost_core::kex::{X25519Keypair, dh_shared, derive_session_key};
 use ghost_core::transcript::Transcript;
 use ghost_core::types::Epoch;
+use ghost_core::aead::AeadKey;
 use ghost_wire::{GHLO, ROTATE};
+use ghost_wire::framing::{AeadFramer, NonceMode};
 use rand::RngCore;
 use time::OffsetDateTime;
 
@@ -91,6 +93,14 @@ fn main() {
 	// Example: derive address
 	let addr = address_for(&ghost_old.keypair.public, e_old);
 	println!("Ghost address (e={}): {:02x?}", e_old, addr);
+
+	// === AEAD framing demo: seal and open a frame carrying ROTATE ===
+	let key = AeadKey::from_bytes(&k_s);
+	let mut framer = AeadFramer::new(key, NonceMode::Random);
+	let frame = framer.seal(&rotate_bytes);
+	let opened = framer.open(&frame).expect("open frame");
+	println!("AEAD frame roundtrip ok: {}", opened == rotate_bytes);
+	println!("AEAD frame size: {} bytes (payload {} + header {})", frame.len(), rotate_bytes.len(), ghost_wire::framing::HEADER_LEN);
 }
 
 
