@@ -10,5 +10,9 @@ serde_cbor = "0.11"
 thiserror = "1"
 ghost-core = { path = "../ghost-core" }
 rand = "0.8"
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+quinn = "0.10"
+rustls = "0.21"
+rcgen = "0.11"
 
 
