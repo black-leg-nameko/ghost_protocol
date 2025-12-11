@@ -8,7 +8,7 @@ use ghost_core::types::Epoch;
 use ghost_core::aead::AeadKey;
 use ghost_core::pow::{solve_pow, verify_pow, PowAlgo};
 use ghost_wire::{GHLO, ROTATE};
-use ghost_wire::framing::{AeadFramer, NonceMode};
+use ghost_wire::framing::{AeadFramer, NonceMode, NONCE_LEN};
 use ghost_wire::router::{encode_response, Router, RouteError};
 use ghost_wire::transport::UdpTransport;
 use rand::RngCore;
@@ -110,6 +110,42 @@ fn main() {
 	let opened = framer.open(&frame).expect("open frame");
 	println!("AEAD frame roundtrip ok: {}", opened == rotate_bytes);
 	println!("AEAD frame size: {} bytes (payload {} + header {})", frame.len(), rotate_bytes.len(), ghost_wire::framing::HEADER_LEN);
+
+	// === AEAD v2 features demo: multiplexing, fragmentation, rekeying ===
+	// Build TX/RX framers sharing the same initial key and counter nonce mode
+	let key_tx = AeadKey::from_bytes(&k_s);
+	let key_rx = AeadKey::from_bytes(&k_s);
+	let mut base_nonce = [0u8; NONCE_LEN];
+	rand::thread_rng().fill_bytes(&mut base_nonce);
+	let mut framer_tx = AeadFramer::new(key_tx, NonceMode::Counter { base: base_nonce, counter: 0 });
+	let mut framer_rx = AeadFramer::new(key_rx, NonceMode::Counter { base: base_nonce, counter: 0 });
+	// Enable HKDF-based rekeying with the session key as base
+	framer_tx.set_base_key(k_s);
+	framer_rx.set_base_key(k_s);
+
+	// Multiplexing: send two small messages on different stream_ids
+	let f1 = framer_tx.seal_on_stream(1, b"hello stream 1");
+	let f2 = framer_tx.seal_on_stream(2, b"hello stream 2");
+	let (m1, p1) = framer_rx.open_frame(&f1).expect("open f1");
+	let (m2, p2) = framer_rx.open_frame(&f2).expect("open f2");
+	println!("MUX stream {} seq {} gen {}: {}", m1.stream_id, m1.seq, m1.generation, String::from_utf8_lossy(&p1));
+	println!("MUX stream {} seq {} gen {}: {}", m2.stream_id, m2.seq, m2.generation, String::from_utf8_lossy(&p2));
+
+	// Fragmentation: split rotate_bytes across multiple frames on stream 3
+	let frags = framer_tx.seal_fragmented(3, &rotate_bytes, 32);
+	let mut reassembled = Vec::new();
+	for frag in frags.iter() {
+		let (_meta, pt) = framer_rx.open_frame(frag).expect("open frag");
+		reassembled.extend_from_slice(&pt);
+	}
+	println!("Fragmentation reassembly ok: {}", reassembled == rotate_bytes);
+
+	// Rekey: derive next key on both ends and exchange a frame (stream 1)
+	framer_tx.rekey_hkdf_next();
+	framer_rx.rekey_hkdf_next();
+	let fr_after_rekey = framer_tx.seal_on_stream(1, b"after rekey");
+	let (m_after, p_after) = framer_rx.open_frame(&fr_after_rekey).expect("open after rekey");
+	println!("After rekey gen {} seq {}: {}", m_after.generation, m_after.seq, String::from_utf8_lossy(&p_after));
 
 	// === Minimal transport demo (UDP loopback) ===
 	let udp = UdpTransport::bind("127.0.0.1:0").expect("bind udp");
