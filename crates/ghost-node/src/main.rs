@@ -15,7 +15,7 @@ use ghost_wire::typed_router::{TypedRouter, make_request, make_response_for};
 use ghost_wire::dht::{DhtStore, Advert, Lookup, LookupResp};
 use ghost_wire::kad::{RoutingTable, NodeId, PeerInfo, PeerScore, Blacklist};
 use ghost_wire::kad_rpc::{start_kad_quic_server, kad_quic_request, T_PING, T_PONG, T_FIND_NODE, T_FIND_NODE_RESP, T_STORE_ADV, T_GET_ADV, T_GET_ADV_RESP, T_REGISTER, T_LIST_PEERS, T_LIST_PEERS_RESP, FindNodeReq, RegisterPeer};
-use ghost_wire::net::quic_ping;
+use ghost_wire::net::{quic_ping, start_udp_kad_server, udp_kad_request, iterative_find_node_udp};
 use ghost_wire::transport::UdpTransport;
 use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many, quic_start_relay_server, quic_relay_open};
 use ghost_wire::nat::stun_binding_request;
@@ -342,6 +342,30 @@ fn main() {
 			Ok(addr) => println!("STUN mapped address: {}", addr),
 			Err(e) => println!("STUN failed: {}", e),
 		}
+	});
+
+	// === UDP DHT handlers: start server, advertise, get, and iterative find_node ===
+	let rt_udp = Runtime::new().expect("tokio runtime");
+	rt_udp.block_on(async {
+		// Build a small RT with one peer entry pointing to this UDP server (for demo distances)
+		let rt_for_udp = RoutingTable::new(local_id);
+		let (sock, task) = start_udp_kad_server("127.0.0.1:0".parse().unwrap(), rt_for_udp).await.expect("udp dht server");
+		let udp_addr = sock.local_addr().expect("udp addr");
+		// STORE_ADV
+		let adv = Advert { addr: vec![9,9,9,9], epoch: e_old, ttl_secs: 30, endpoint: format!("udp://{}", udp_addr) };
+		let store_env = Envelope::new(ghost_wire::kad_rpc::T_STORE_ADV, 1, serde_cbor::to_value(adv).unwrap());
+		let _ = udp_kad_request(udp_addr, &store_env, 800).await.expect("udp store adv");
+		// GET_ADV
+		let get_env = Envelope::new(ghost_wire::kad_rpc::T_GET_ADV, 1, serde_cbor::to_value(Lookup { addr: vec![9,9,9,9] }).unwrap());
+		let got = udp_kad_request(udp_addr, &get_env, 800).await.expect("udp get adv");
+		println!("UDP GET_ADV type_id {}", got.type_id);
+		// Iterative FIND_NODE over UDP (seed list contains only this server; demo will converge immediately)
+		let seeds = vec![udp_addr];
+		let res = iterative_find_node_udp(&RoutingTable::new(local_id), seeds, local_id, 2, 8, 2).await.expect("iter find");
+		println!("UDP iterative find returned {} peers", res.len());
+		// shutdown
+		drop(sock);
+		task.abort();
 	});
 
 	// === Relay fallback via QUIC: pair two clients with the same session id ===

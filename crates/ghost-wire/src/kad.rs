@@ -103,8 +103,23 @@ impl KBucket {
 			self.entries.push_back(info);
 		} else {
 			if self.entries.len() >= self.k {
-				// drop LRU with worst score (approx: front)
-				let _ = self.entries.pop_front();
+				// Evict the peer with worst score; fallback to LRU (front)
+				let mut worst_idx = 0usize;
+				let mut worst_score = None;
+				for (i, p) in self.entries.iter().enumerate() {
+					if let Some(ws) = &worst_score {
+						if p.score.cmp_quality(ws) == std::cmp::Ordering::Less {
+							worst_idx = i;
+							worst_score = Some(p.score.clone());
+						}
+					} else {
+						worst_idx = i;
+						worst_score = Some(p.score.clone());
+					}
+				}
+				if self.entries.len() > 0 {
+					let _ = self.entries.remove(worst_idx);
+				}
 			}
 			self.entries.push_back(info);
 		}
@@ -117,6 +132,7 @@ impl KBucket {
 pub struct RoutingTable {
 	pub local_id: NodeId,
 	pub buckets: Vec<KBucket>, // 0..=256
+	pub blacklist: Blacklist,
 }
 
 impl RoutingTable {
@@ -125,12 +141,51 @@ impl RoutingTable {
 		for _ in 0..=ID_LEN * 8 {
 			buckets.push(KBucket::new(K));
 		}
-		Self { local_id, buckets }
+		Self { local_id, buckets, blacklist: Blacklist::new() }
 	}
 
 	pub fn insert_or_update(&mut self, info: PeerInfo) {
+		if self.blacklist.contains(&info.id) {
+			return;
+		}
 		let idx = self.local_id.bucket_index(&info.id);
 		self.buckets[idx].upsert(info);
+	}
+
+	/// Update peer score and reflect blacklist automatically if needed.
+	pub fn record_result(&mut self, peer_id: &NodeId, success: bool, latency_ms: Option<f64>) {
+		// Find and update in-place
+		for b in &mut self.buckets {
+			if let Some(pos) = b.entries.iter().position(|p| &p.id == peer_id) {
+				let mut p = b.entries.remove(pos).unwrap();
+				if success {
+					p.score.on_success(latency_ms.unwrap_or(0.0));
+				} else {
+					p.score.on_failure();
+				}
+				if p.score.is_bad() {
+					self.blacklist.add(&p.id);
+					// do not reinsert
+				} else {
+					b.entries.push_back(p);
+				}
+				break;
+			}
+		}
+	}
+
+	/// Reindex all bucket entries for a new local_id (e.g., identity rotation).
+	pub fn reindex_for_local_id(&mut self, new_local_id: NodeId) {
+		let mut all = Vec::new();
+		for b in &mut self.buckets {
+			for p in b.entries.drain(..) {
+				all.push(p);
+			}
+		}
+		self.local_id = new_local_id;
+		for p in all {
+			self.insert_or_update(p);
+		}
 	}
 
 	pub fn find_closest(&self, target: &NodeId, n: usize) -> Vec<PeerInfo> {
