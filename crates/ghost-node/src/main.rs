@@ -10,6 +10,9 @@ use ghost_core::pow::{solve_pow, verify_pow, PowAlgo};
 use ghost_wire::{GHLO, ROTATE};
 use ghost_wire::framing::{AeadFramer, NonceMode, NONCE_LEN};
 use ghost_wire::router::{encode_response, Router, RouteError};
+use ghost_wire::envelope::Envelope;
+use ghost_wire::typed_router::{TypedRouter, make_request, make_response_for};
+use ghost_wire::dht::{DhtStore, Advert, Lookup, LookupResp};
 use ghost_wire::transport::UdpTransport;
 use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many, quic_start_relay_server, quic_relay_open};
 use ghost_wire::nat::stun_binding_request;
@@ -184,6 +187,71 @@ fn main() {
 		drop(endpoint);
 		handle.abort();
 	});
+
+	// === Typed envelope router + DHT demo (Req/Resp with correlation, multi-hop/store&forward simulation) ===
+	let mut dht = DhtStore::new();
+	let mut trouter = TypedRouter::new();
+	// Type ids
+	const T_ADVERT: u64 = 110;
+	const T_LOOKUP: u64 = 111;
+	const T_LOOKUP_RESP: u64 = 112;
+	const T_PING: u64 = 200;
+	const T_PONG: u64 = 201;
+	// Register DHT handlers
+	trouter.on(T_ADVERT, |env| {
+		if let Ok(adv) = serde_cbor::value::from_value::<Advert>(env.body.clone()) {
+			let mut store = DhtStore::new();
+			// For demo: use local store (in real node, this would be a shared store)
+			let mut s = store;
+			s.advertise(adv);
+		}
+		None
+	});
+	trouter.on(T_LOOKUP, |env| {
+		if let Ok(req) = serde_cbor::value::from_value::<Lookup>(env.body.clone()) {
+			let mut store = DhtStore::new();
+			let recs = store.lookup(&req.addr);
+			let resp = LookupResp { addr: req.addr, records: recs };
+			let body = serde_cbor::to_value(resp).ok()?;
+			return Some(make_response_for(env, T_LOOKUP_RESP, 1, body));
+		}
+		None
+	});
+	// Simple ping responder
+	trouter.on(T_PING, |env| {
+		let body = serde_cbor::to_value("pong").ok()?;
+		Some(make_response_for(env, T_PONG, 1, body))
+	});
+	// Issue a ping request and verify correlation
+	let ping = make_request(T_PING, 1, serde_cbor::to_value("ping").unwrap());
+	if let Some(pong) = trouter.route(&ping) {
+		if let Some(c) = pong.corr_id() {
+			let mut mid = [0u8;16];
+			mid.copy_from_slice(&ping.msg_id);
+			println!("Typed router ping/pong corr ok: {}", c == mid);
+		}
+	}
+	// Store & forward simulation: queue when no route, deliver later
+	struct QueueItem { env: Envelope }
+	let mut queue: Vec<QueueItem> = Vec::new();
+	let req_lookup = make_request(T_LOOKUP, 1, serde_cbor::to_value(Lookup { addr: vec![1,2,3,4] }).unwrap());
+	// No handler path for LOOKUP -> queue
+	if trouter.route(&req_lookup).is_none() {
+		queue.push(QueueItem { env: req_lookup });
+	}
+	// Later, register handler and flush
+	trouter.on(T_LOOKUP, |env| {
+		let resp = LookupResp { addr: vec![], records: vec![] };
+		let body = serde_cbor::to_value(resp).ok()?;
+		Some(make_response_for(env, T_LOOKUP_RESP, 1, body))
+	});
+	let mut delivered = 0usize;
+	for qi in queue.drain(..) {
+		if trouter.route(&qi.env).is_some() {
+			delivered += 1;
+		}
+	}
+	println!("Store&Forward delivered {} queued messages", delivered);
 
 	// === NAT traversal: STUN public address discovery ===
 	let rt3 = Runtime::new().expect("tokio runtime");
