@@ -10,6 +10,12 @@ use ghost_core::pow::{solve_pow, verify_pow, PowAlgo};
 use ghost_wire::{GHLO, ROTATE};
 use ghost_wire::framing::{AeadFramer, NonceMode, NONCE_LEN};
 use ghost_wire::router::{encode_response, Router, RouteError};
+use ghost_wire::envelope::Envelope;
+use ghost_wire::typed_router::{TypedRouter, make_request, make_response_for};
+use ghost_wire::dht::{DhtStore, Advert, Lookup, LookupResp};
+use ghost_wire::kad::{RoutingTable, NodeId, PeerInfo, PeerScore, Blacklist};
+use ghost_wire::kad_rpc::{start_kad_quic_server, kad_quic_request, T_PING, T_PONG, T_FIND_NODE, T_FIND_NODE_RESP, T_STORE_ADV, T_GET_ADV, T_GET_ADV_RESP, T_REGISTER, T_LIST_PEERS, T_LIST_PEERS_RESP, FindNodeReq, RegisterPeer};
+use ghost_wire::net::{quic_ping, start_udp_kad_server, udp_kad_request, iterative_find_node_udp};
 use ghost_wire::transport::UdpTransport;
 use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many, quic_start_relay_server, quic_relay_open};
 use ghost_wire::nat::stun_binding_request;
@@ -185,6 +191,149 @@ fn main() {
 		handle.abort();
 	});
 
+	// === Typed envelope router + DHT demo (Req/Resp with correlation, multi-hop/store&forward simulation) ===
+	let mut dht = DhtStore::new();
+	let mut trouter = TypedRouter::new();
+	// Type ids
+	const T_ADVERT: u64 = 110;
+	const T_LOOKUP: u64 = 111;
+	const T_LOOKUP_RESP: u64 = 112;
+	const T_PING: u64 = 200;
+	const T_PONG: u64 = 201;
+	// Register DHT handlers
+	trouter.on(T_ADVERT, |env| {
+		if let Ok(adv) = serde_cbor::value::from_value::<Advert>(env.body.clone()) {
+			let mut store = DhtStore::new();
+			// For demo: use local store (in real node, this would be a shared store)
+			let mut s = store;
+			s.advertise(adv);
+		}
+		None
+	});
+	trouter.on(T_LOOKUP, |env| {
+		if let Ok(req) = serde_cbor::value::from_value::<Lookup>(env.body.clone()) {
+			let mut store = DhtStore::new();
+			let recs = store.lookup(&req.addr);
+			let resp = LookupResp { addr: req.addr, records: recs };
+			let body = serde_cbor::to_value(resp).ok()?;
+			return Some(make_response_for(env, T_LOOKUP_RESP, 1, body));
+		}
+		None
+	});
+	// Simple ping responder
+	trouter.on(T_PING, |env| {
+		let body = serde_cbor::to_value("pong").ok()?;
+		Some(make_response_for(env, T_PONG, 1, body))
+	});
+	// Issue a ping request and verify correlation
+	let ping = make_request(T_PING, 1, serde_cbor::to_value("ping").unwrap());
+	if let Some(pong) = trouter.route(&ping) {
+		if let Some(c) = pong.corr_id() {
+			let mut mid = [0u8;16];
+			mid.copy_from_slice(&ping.msg_id);
+			println!("Typed router ping/pong corr ok: {}", c == mid);
+		}
+	}
+	// Store & forward simulation: queue when no route, deliver later
+	struct QueueItem { env: Envelope }
+	let mut queue: Vec<QueueItem> = Vec::new();
+	let req_lookup = make_request(T_LOOKUP, 1, serde_cbor::to_value(Lookup { addr: vec![1,2,3,4] }).unwrap());
+	// No handler path for LOOKUP -> queue
+	if trouter.route(&req_lookup).is_none() {
+		queue.push(QueueItem { env: req_lookup });
+	}
+	// Later, register handler and flush
+	trouter.on(T_LOOKUP, |env| {
+		let resp = LookupResp { addr: vec![], records: vec![] };
+		let body = serde_cbor::to_value(resp).ok()?;
+		Some(make_response_for(env, T_LOOKUP_RESP, 1, body))
+	});
+	let mut delivered = 0usize;
+	for qi in queue.drain(..) {
+		if trouter.route(&qi.env).is_some() {
+			delivered += 1;
+		}
+	}
+	println!("Store&Forward delivered {} queued messages", delivered);
+
+	// === Kademlia: NodeId/RT/K-bucket/Bootstrap(Ping via QUIC) ===
+	// Derive local NodeId from pk_old hash
+	use ghost_core::kdf::sha512_256;
+	let mut nid_local = [0u8; 32];
+	nid_local.copy_from_slice(&sha512_256(&ghost_old.keypair.public.compress().to_bytes()));
+	let local_id = NodeId(nid_local);
+	let mut rt = RoutingTable::new(local_id);
+	// Start a persistent QUIC server (as 'seed') and bootstrap
+	let rt_boot = Runtime::new().expect("tokio runtime");
+	rt_boot.block_on(async {
+		let (endpoint, seed_addr, seed_cert, handle) = quic_start_server("127.0.0.1:0").await.expect("start seed");
+		// Compute seed NodeId from address bytes (demo purpose)
+		let mut nid_seed = [0u8; 32];
+		nid_seed.copy_from_slice(&sha512_256(&seed_addr.to_string().as_bytes()));
+		let seed_id = NodeId(nid_seed);
+		// Ping seed and update score
+		let rtt = quic_ping(seed_addr, &seed_cert, b"ping-rt").await.expect("ping");
+		let mut pi = ghost_wire::kad::PeerInfo {
+			id: seed_id,
+			endpoint: format!("quic://{}", seed_addr),
+			last_seen: std::time::SystemTime::now(),
+			score: ghost_wire::kad::PeerScore::new(),
+		};
+		pi.score.on_success(rtt.as_millis() as f64);
+		rt.insert_or_update(pi);
+		// Lookup closest to random target
+		let target = NodeId(sha512_256(b"target-demo"));
+		let closest = rt.find_closest(&target, 5);
+		println!("Kad closest {} peers:", closest.len());
+		for p in closest {
+			println!("  peer {} ... {}", &hex::encode(&p.id.0)[..8], p.endpoint);
+		}
+		// Shutdown seed
+		drop(endpoint);
+		handle.abort();
+	});
+
+	// === Kademlia RPC over QUIC: start kad server and perform basic RPCs ===
+	let rt_kad = RoutingTable::new(local_id);
+	let rt5 = Runtime::new().expect("tokio runtime");
+	rt5.block_on(async move {
+		let (endpoint, addr, cert, handle) = start_kad_quic_server("127.0.0.1:0", rt_kad).await.expect("start kad server");
+		// PING
+		let ping_env = Envelope::new(T_PING, 1, serde_cbor::to_value("ping").unwrap());
+		let pong = kad_quic_request(addr, &cert, &ping_env).await.expect("kad ping");
+		println!("Kad PING-> type_id {}", pong.type_id);
+		// REGISTER & LIST_PEERS
+		let reg = RegisterPeer { id: nid_local.to_vec(), endpoint: format!("quic://{}", addr) };
+		let reg_env = Envelope::new(T_REGISTER, 1, serde_cbor::to_value(reg).unwrap());
+		let _ = kad_quic_request(addr, &cert, &reg_env).await.expect("kad register");
+		let list_env = Envelope::new(T_LIST_PEERS, 1, serde_cbor::to_value(()).unwrap());
+		let listed = kad_quic_request(addr, &cert, &list_env).await.expect("kad list");
+		println!("Kad LIST peers type_id {}", listed.type_id);
+		// FIND_NODE
+		let fnd = FindNodeReq { target: nid_local.to_vec(), count: 5 };
+		let fnd_env = Envelope::new(T_FIND_NODE, 1, serde_cbor::to_value(fnd).unwrap());
+		let _ = kad_quic_request(addr, &cert, &fnd_env).await.expect("kad find_node");
+		// STORE/GET adverts
+		let adv = Advert { addr: vec![1,2,3,4], epoch: e_old, ttl_secs: 60, endpoint: format!("quic://{}", addr) };
+		let store_env = Envelope::new(T_STORE_ADV, 1, serde_cbor::to_value(adv).unwrap());
+		let _ = kad_quic_request(addr, &cert, &store_env).await.expect("kad store");
+		let get_env = Envelope::new(T_GET_ADV, 1, serde_cbor::to_value(Lookup { addr: vec![1,2,3,4] }).unwrap());
+		let got = kad_quic_request(addr, &cert, &get_env).await.expect("kad get");
+		println!("Kad GET adverts type_id {}", got.type_id);
+		// shutdown
+		drop(endpoint);
+		handle.abort();
+	});
+
+	// === Peer score decay and blacklist demo ===
+	let mut score = PeerScore::new();
+	score.on_failure(); score.on_failure();
+	score.decay(120.0);
+	let mut bl = Blacklist::new();
+	if score.is_bad() {
+		bl.add(&local_id);
+	}
+	println!("Blacklist contains local? {}", bl.contains(&local_id));
 	// === NAT traversal: STUN public address discovery ===
 	let rt3 = Runtime::new().expect("tokio runtime");
 	rt3.block_on(async {
@@ -193,6 +342,30 @@ fn main() {
 			Ok(addr) => println!("STUN mapped address: {}", addr),
 			Err(e) => println!("STUN failed: {}", e),
 		}
+	});
+
+	// === UDP DHT handlers: start server, advertise, get, and iterative find_node ===
+	let rt_udp = Runtime::new().expect("tokio runtime");
+	rt_udp.block_on(async {
+		// Build a small RT with one peer entry pointing to this UDP server (for demo distances)
+		let rt_for_udp = RoutingTable::new(local_id);
+		let (sock, task) = start_udp_kad_server("127.0.0.1:0".parse().unwrap(), rt_for_udp).await.expect("udp dht server");
+		let udp_addr = sock.local_addr().expect("udp addr");
+		// STORE_ADV
+		let adv = Advert { addr: vec![9,9,9,9], epoch: e_old, ttl_secs: 30, endpoint: format!("udp://{}", udp_addr) };
+		let store_env = Envelope::new(ghost_wire::kad_rpc::T_STORE_ADV, 1, serde_cbor::to_value(adv).unwrap());
+		let _ = udp_kad_request(udp_addr, &store_env, 800).await.expect("udp store adv");
+		// GET_ADV
+		let get_env = Envelope::new(ghost_wire::kad_rpc::T_GET_ADV, 1, serde_cbor::to_value(Lookup { addr: vec![9,9,9,9] }).unwrap());
+		let got = udp_kad_request(udp_addr, &get_env, 800).await.expect("udp get adv");
+		println!("UDP GET_ADV type_id {}", got.type_id);
+		// Iterative FIND_NODE over UDP (seed list contains only this server; demo will converge immediately)
+		let seeds = vec![udp_addr];
+		let res = iterative_find_node_udp(&RoutingTable::new(local_id), seeds, local_id, 2, 8, 2).await.expect("iter find");
+		println!("UDP iterative find returned {} peers", res.len());
+		// shutdown
+		drop(sock);
+		task.abort();
 	});
 
 	// === Relay fallback via QUIC: pair two clients with the same session id ===

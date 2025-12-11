@@ -6,6 +6,12 @@ pub mod router;
 pub mod transport;
 pub mod quic;
 pub mod nat;
+pub mod envelope;
+pub mod typed_router;
+pub mod dht;
+pub mod kad;
+pub mod net;
+pub mod kad_rpc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GHLO {
