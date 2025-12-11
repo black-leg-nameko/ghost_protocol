@@ -6,5 +6,6 @@ pub mod aead;
 pub mod kex;
 pub mod transcript;
 pub mod pow;
+pub mod mac;
 
 

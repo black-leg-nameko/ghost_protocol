@@ -2,10 +2,11 @@
 
 This repository contains a Rust implementation scaffold for the Ghost: Ephemeral Network Persona (ENP) protocol.
 
-- Protocol spec: `docs/spec.md`
+- Protocol spec (v0.2): `docs/spec.md`
+- Wire CDDL schemas: `docs/cddl/ghost-wire.cddl`
 - Crates:
   - `ghost-core`: crypto primitives (keys, HKDF, AEAD), DV-Schnorr rotate proof
-  - `ghost-wire`: CBOR message definitions and helpers
+  - `ghost-wire`: CBOR message definitions and helpers (typed envelope, capability negotiation)
   - `ghost-node`: small demo binary (key gen, GHLO/ROTATE example)
 
 ## Build

@@ -27,4 +27,13 @@ pub fn derive_session_key(shared: &SharedSecret, transcript_hash: &[u8]) -> [u8;
 	out
 }
 
+/// Convenience: compute DH given peer public key as raw 32-byte array.
+pub fn dh_shared_with_bytes(secret: EphemeralSecret, peer_public_bytes: &[u8]) -> Option<SharedSecret> {
+	if peer_public_bytes.len() != 32 { return None; }
+	let mut arr = [0u8; 32];
+	arr.copy_from_slice(peer_public_bytes);
+	let pk = PublicKey::from(arr);
+	Some(secret.diffie_hellman(&pk))
+}
+
 
