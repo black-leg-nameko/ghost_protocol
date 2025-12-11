@@ -64,6 +64,19 @@ impl PeerScore {
 	pub fn on_failure(&mut self) {
 		self.failures += 1;
 	}
+	/// Exponential decay toward baseline; call periodically with elapsed seconds.
+	pub fn decay(&mut self, elapsed_secs: f64) {
+		let beta = (elapsed_secs / 60.0).min(1.0); // decay over ~1min
+		self.latency_ms_ema = (1.0 - beta) * self.latency_ms_ema;
+		if self.failures > 0 {
+			let dec = (self.failures as f64) * (1.0 - beta);
+			self.failures = dec as u64;
+		}
+	}
+	/// Heuristic: blacklist if failures exceed threshold or EMA too high.
+	pub fn is_bad(&self) -> bool {
+		self.failures >= 5 || self.latency_ms_ema > 5000.0
+	}
 	pub fn cmp_quality(&self, other: &PeerScore) -> Ordering {
 		// lower EMA latency and fewer failures preferred
 		self.failures.cmp(&other.failures).then_with(|| {
@@ -135,6 +148,27 @@ impl RoutingTable {
 		all.truncate(n);
 		all
 	}
+}
+
+use std::collections::HashSet;
+use std::time::SystemTime;
+
+#[derive(Clone, Debug)]
+pub struct BlacklistEntry {
+	pub id: NodeId,
+	pub expiry: SystemTime,
+}
+
+#[derive(Default)]
+pub struct Blacklist {
+	set: HashSet<[u8;32]>,
+}
+
+impl Blacklist {
+	pub fn new() -> Self { Self { set: HashSet::new() } }
+	pub fn add(&mut self, id: &NodeId) { self.set.insert(id.0); }
+	pub fn contains(&self, id: &NodeId) -> bool { self.set.contains(&id.0) }
+	pub fn remove(&mut self, id: &NodeId) { self.set.remove(&id.0); }
 }
 
 

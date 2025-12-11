@@ -13,7 +13,8 @@ use ghost_wire::router::{encode_response, Router, RouteError};
 use ghost_wire::envelope::Envelope;
 use ghost_wire::typed_router::{TypedRouter, make_request, make_response_for};
 use ghost_wire::dht::{DhtStore, Advert, Lookup, LookupResp};
-use ghost_wire::kad::{RoutingTable, NodeId};
+use ghost_wire::kad::{RoutingTable, NodeId, PeerInfo, PeerScore, Blacklist};
+use ghost_wire::kad_rpc::{start_kad_quic_server, kad_quic_request, T_PING, T_PONG, T_FIND_NODE, T_FIND_NODE_RESP, T_STORE_ADV, T_GET_ADV, T_GET_ADV_RESP, T_REGISTER, T_LIST_PEERS, T_LIST_PEERS_RESP, FindNodeReq, RegisterPeer};
 use ghost_wire::net::quic_ping;
 use ghost_wire::transport::UdpTransport;
 use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many, quic_start_relay_server, quic_relay_open};
@@ -292,6 +293,47 @@ fn main() {
 		handle.abort();
 	});
 
+	// === Kademlia RPC over QUIC: start kad server and perform basic RPCs ===
+	let rt_kad = RoutingTable::new(local_id);
+	let rt5 = Runtime::new().expect("tokio runtime");
+	rt5.block_on(async move {
+		let (endpoint, addr, cert, handle) = start_kad_quic_server("127.0.0.1:0", rt_kad).await.expect("start kad server");
+		// PING
+		let ping_env = Envelope::new(T_PING, 1, serde_cbor::to_value("ping").unwrap());
+		let pong = kad_quic_request(addr, &cert, &ping_env).await.expect("kad ping");
+		println!("Kad PING-> type_id {}", pong.type_id);
+		// REGISTER & LIST_PEERS
+		let reg = RegisterPeer { id: nid_local.to_vec(), endpoint: format!("quic://{}", addr) };
+		let reg_env = Envelope::new(T_REGISTER, 1, serde_cbor::to_value(reg).unwrap());
+		let _ = kad_quic_request(addr, &cert, &reg_env).await.expect("kad register");
+		let list_env = Envelope::new(T_LIST_PEERS, 1, serde_cbor::to_value(()).unwrap());
+		let listed = kad_quic_request(addr, &cert, &list_env).await.expect("kad list");
+		println!("Kad LIST peers type_id {}", listed.type_id);
+		// FIND_NODE
+		let fnd = FindNodeReq { target: nid_local.to_vec(), count: 5 };
+		let fnd_env = Envelope::new(T_FIND_NODE, 1, serde_cbor::to_value(fnd).unwrap());
+		let _ = kad_quic_request(addr, &cert, &fnd_env).await.expect("kad find_node");
+		// STORE/GET adverts
+		let adv = Advert { addr: vec![1,2,3,4], epoch: e_old, ttl_secs: 60, endpoint: format!("quic://{}", addr) };
+		let store_env = Envelope::new(T_STORE_ADV, 1, serde_cbor::to_value(adv).unwrap());
+		let _ = kad_quic_request(addr, &cert, &store_env).await.expect("kad store");
+		let get_env = Envelope::new(T_GET_ADV, 1, serde_cbor::to_value(Lookup { addr: vec![1,2,3,4] }).unwrap());
+		let got = kad_quic_request(addr, &cert, &get_env).await.expect("kad get");
+		println!("Kad GET adverts type_id {}", got.type_id);
+		// shutdown
+		drop(endpoint);
+		handle.abort();
+	});
+
+	// === Peer score decay and blacklist demo ===
+	let mut score = PeerScore::new();
+	score.on_failure(); score.on_failure();
+	score.decay(120.0);
+	let mut bl = Blacklist::new();
+	if score.is_bad() {
+		bl.add(&local_id);
+	}
+	println!("Blacklist contains local? {}", bl.contains(&local_id));
 	// === NAT traversal: STUN public address discovery ===
 	let rt3 = Runtime::new().expect("tokio runtime");
 	rt3.block_on(async {
