@@ -11,8 +11,10 @@ use ghost_wire::{GHLO, ROTATE};
 use ghost_wire::framing::{AeadFramer, NonceMode, NONCE_LEN};
 use ghost_wire::router::{encode_response, Router, RouteError};
 use ghost_wire::transport::UdpTransport;
+use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many};
 use rand::RngCore;
 use time::OffsetDateTime;
+use tokio::runtime::Runtime;
 
 fn current_epoch(t_seconds: u64, epoch_secs: u64) -> Epoch {
 	t_seconds / epoch_secs
@@ -155,6 +157,32 @@ fn main() {
 		let opened2 = framer.open(&rx).expect("open frame via UDP");
 		println!("UDP frame roundtrip ok: {}", opened2 == rotate_bytes);
 	}
+
+	// === QUIC (quinn) echo demo (oneshot) ===
+	let rt = Runtime::new().expect("tokio runtime");
+	let rotate_bytes_clone = rotate_bytes.clone();
+	rt.block_on(async move {
+		let (srv_addr, srv_cert, _task) = quic_echo_oneshot_server("127.0.0.1:0").await.expect("start quic server");
+		let echoed = quic_echo_client(srv_addr, &srv_cert, &rotate_bytes_clone).await.expect("quic echo");
+		println!("QUIC echo roundtrip ok: {}", echoed == rotate_bytes_clone);
+	});
+
+	// === QUIC persistent server + multi-stream client demo ===
+	let rt2 = Runtime::new().expect("tokio runtime");
+	rt2.block_on(async move {
+		let (endpoint, srv_addr, srv_cert, handle) = quic_start_server("127.0.0.1:0").await.expect("start persistent quic server");
+		let payloads = vec![
+			b"stream A".to_vec(),
+			b"stream B".to_vec(),
+			b"stream C".to_vec(),
+		];
+		let echoed_many = quic_client_send_many(srv_addr, &srv_cert, payloads.clone()).await.expect("quic many");
+		let ok = echoed_many == payloads;
+		println!("QUIC multi-stream roundtrip ok: {}", ok);
+		// shutdown: drop endpoint and abort server loop
+		drop(endpoint);
+		handle.abort();
+	});
 
 	// === Minimal routing demo ===
 	let mut router = Router::new();

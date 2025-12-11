@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 pub mod framing;
 pub mod router;
 pub mod transport;
+pub mod quic;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GHLO {
