@@ -11,7 +11,8 @@ use ghost_wire::{GHLO, ROTATE};
 use ghost_wire::framing::{AeadFramer, NonceMode, NONCE_LEN};
 use ghost_wire::router::{encode_response, Router, RouteError};
 use ghost_wire::transport::UdpTransport;
-use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many};
+use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many, quic_start_relay_server, quic_relay_open};
+use ghost_wire::nat::stun_binding_request;
 use rand::RngCore;
 use time::OffsetDateTime;
 use tokio::runtime::Runtime;
@@ -180,6 +181,55 @@ fn main() {
 		let ok = echoed_many == payloads;
 		println!("QUIC multi-stream roundtrip ok: {}", ok);
 		// shutdown: drop endpoint and abort server loop
+		drop(endpoint);
+		handle.abort();
+	});
+
+	// === NAT traversal: STUN public address discovery ===
+	let rt3 = Runtime::new().expect("tokio runtime");
+	rt3.block_on(async {
+		let stun_server = "stun.l.google.com:19302".parse().unwrap();
+		match stun_binding_request(stun_server).await {
+			Ok(addr) => println!("STUN mapped address: {}", addr),
+			Err(e) => println!("STUN failed: {}", e),
+		}
+	});
+
+	// === Relay fallback via QUIC: pair two clients with the same session id ===
+	let rt4 = Runtime::new().expect("tokio runtime");
+	rt4.block_on(async {
+		let (endpoint, srv_addr, srv_cert, handle) = quic_start_relay_server("127.0.0.1:0").await.expect("start relay");
+		let session_id = *b"ghost-relay-demo!";
+		// Client A
+		let payload = b"hello via relay".to_vec();
+		let t_a = tokio::spawn({
+			let cert = srv_cert.clone();
+			let p = payload.clone();
+			async move {
+				let (mut send, _recv) = quic_relay_open(srv_addr, &cert, session_id).await.expect("relay open A");
+				// protocol: A sends length+payload and finishes
+				let len = (p.len() as u32).to_be_bytes();
+				let _ = send.write_all(&len).await;
+				let _ = send.write_all(&p).await;
+				let _ = send.finish().await;
+			}
+		});
+		// Client B
+		let t_b = tokio::spawn({
+			let cert = srv_cert.clone();
+			async move {
+				let (_send, mut recv) = quic_relay_open(srv_addr, &cert, session_id).await.expect("relay open B");
+				let mut len_buf = [0u8; 4];
+				recv.read_exact(&mut len_buf).await.expect("read len");
+				let len = u32::from_be_bytes(len_buf) as usize;
+				let mut buf = vec![0u8; len];
+				recv.read_exact(&mut buf).await.expect("read body");
+				println!("Relay received: {}", String::from_utf8_lossy(&buf));
+			}
+		});
+		let _ = t_a.await;
+		let _ = t_b.await;
+		// shutdown relay
 		drop(endpoint);
 		handle.abort();
 	});
