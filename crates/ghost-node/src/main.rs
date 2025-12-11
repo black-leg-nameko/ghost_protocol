@@ -13,6 +13,8 @@ use ghost_wire::router::{encode_response, Router, RouteError};
 use ghost_wire::envelope::Envelope;
 use ghost_wire::typed_router::{TypedRouter, make_request, make_response_for};
 use ghost_wire::dht::{DhtStore, Advert, Lookup, LookupResp};
+use ghost_wire::kad::{RoutingTable, NodeId};
+use ghost_wire::net::quic_ping;
 use ghost_wire::transport::UdpTransport;
 use ghost_wire::quic::{quic_echo_client, quic_echo_oneshot_server, quic_start_server, quic_client_send_many, quic_start_relay_server, quic_relay_open};
 use ghost_wire::nat::stun_binding_request;
@@ -252,6 +254,43 @@ fn main() {
 		}
 	}
 	println!("Store&Forward delivered {} queued messages", delivered);
+
+	// === Kademlia: NodeId/RT/K-bucket/Bootstrap(Ping via QUIC) ===
+	// Derive local NodeId from pk_old hash
+	use ghost_core::kdf::sha512_256;
+	let mut nid_local = [0u8; 32];
+	nid_local.copy_from_slice(&sha512_256(&ghost_old.keypair.public.compress().to_bytes()));
+	let local_id = NodeId(nid_local);
+	let mut rt = RoutingTable::new(local_id);
+	// Start a persistent QUIC server (as 'seed') and bootstrap
+	let rt_boot = Runtime::new().expect("tokio runtime");
+	rt_boot.block_on(async {
+		let (endpoint, seed_addr, seed_cert, handle) = quic_start_server("127.0.0.1:0").await.expect("start seed");
+		// Compute seed NodeId from address bytes (demo purpose)
+		let mut nid_seed = [0u8; 32];
+		nid_seed.copy_from_slice(&sha512_256(&seed_addr.to_string().as_bytes()));
+		let seed_id = NodeId(nid_seed);
+		// Ping seed and update score
+		let rtt = quic_ping(seed_addr, &seed_cert, b"ping-rt").await.expect("ping");
+		let mut pi = ghost_wire::kad::PeerInfo {
+			id: seed_id,
+			endpoint: format!("quic://{}", seed_addr),
+			last_seen: std::time::SystemTime::now(),
+			score: ghost_wire::kad::PeerScore::new(),
+		};
+		pi.score.on_success(rtt.as_millis() as f64);
+		rt.insert_or_update(pi);
+		// Lookup closest to random target
+		let target = NodeId(sha512_256(b"target-demo"));
+		let closest = rt.find_closest(&target, 5);
+		println!("Kad closest {} peers:", closest.len());
+		for p in closest {
+			println!("  peer {} ... {}", &hex::encode(&p.id.0)[..8], p.endpoint);
+		}
+		// Shutdown seed
+		drop(endpoint);
+		handle.abort();
+	});
 
 	// === NAT traversal: STUN public address discovery ===
 	let rt3 = Runtime::new().expect("tokio runtime");
