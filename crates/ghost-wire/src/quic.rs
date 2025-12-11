@@ -7,6 +7,8 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use futures_util::StreamExt;
 use futures_util::future::join_all;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Error)]
 pub enum QuicError {
@@ -133,6 +135,79 @@ pub async fn quic_start_server<A: ToSocketAddrs>(bind: A) -> Result<(Endpoint, S
 		}
 	});
 	Ok((endpoint, endpoint.local_addr()?, cert_der, task))
+}
+
+async fn forward(mut recv: RecvStream, mut send: SendStream) {
+	let mut buf = vec![0u8; 1400];
+	while let Ok(n) = recv.read(&mut buf).await {
+		if n == 0 { break; }
+		if send.write_all(&buf[..n]).await.is_err() {
+			break;
+		}
+	}
+	let _ = send.finish().await;
+}
+
+/// Start a relay server. Each incoming BiDi stream must send a 16-byte session id first.
+/// Two streams with the same session id are paired and bytes are forwarded bidirectionally.
+pub async fn quic_start_relay_server<A: ToSocketAddrs>(bind: A) -> Result<(Endpoint, SocketAddr, Vec<u8>, tokio::task::JoinHandle<()>), QuicError> {
+	let (server_cfg, cert_der) = make_server_config()?;
+	let bind_addr = bind.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addr"))?;
+	let endpoint = Endpoint::server(server_cfg, bind_addr)?;
+	let mut incoming = endpoint.incoming();
+	let state: Arc<Mutex<HashMap<[u8;16], Vec<(SendStream, RecvStream)>>>> = Arc::new(Mutex::new(HashMap::new()));
+	let task = {
+		let state = state.clone();
+		tokio::spawn(async move {
+			while let Some(connecting) = incoming.next().await {
+				match connecting.await {
+					Ok(conn) => {
+						let state = state.clone();
+						tokio::spawn(async move {
+							loop {
+								match conn.accept_bi().await {
+									Ok((mut send, mut recv)) => {
+										// read 16-byte session id
+										let mut sid = [0u8; 16];
+										if recv.read_exact(&mut sid).await.is_err() {
+											let _ = send.finish().await;
+											break;
+										}
+										let mut map = state.lock().unwrap();
+										let entry = map.entry(sid).or_default();
+										entry.push((send, recv));
+										if entry.len() >= 2 {
+											let (s1, r1) = entry.remove(0);
+											let (s2, r2) = entry.remove(0);
+											drop(map);
+											tokio::spawn(forward(r1, s2));
+											tokio::spawn(forward(r2, s1));
+										}
+									}
+									Err(_) => break,
+								}
+							}
+						});
+					}
+					Err(_e) => break,
+				}
+			}
+		})
+	};
+	Ok((endpoint, endpoint.local_addr()?, cert_der, task))
+}
+
+/// Connect to relay server and open a paired stream for a given 16-byte session id.
+/// Returns (SendStream, RecvStream) where application can write/read relayed bytes.
+pub async fn quic_relay_open(server_addr: SocketAddr, server_cert_der: &[u8], session_id: [u8;16]) -> Result<(SendStream, RecvStream), QuicError> {
+	let client_cfg = make_client_config(server_cert_der)?;
+	let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
+	endpoint.set_default_client_config(client_cfg);
+	let conn = endpoint.connect(server_addr, "localhost")?.await?;
+	let (mut send, mut recv) = conn.open_bi().await?;
+	// send session id header
+	send.write_all(&session_id).await?;
+	Ok((send, recv))
 }
 
 /// Single connection, multiple concurrent bidi streams to the server. Returns echoed payloads in order.

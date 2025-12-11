@@ -5,6 +5,7 @@ pub mod framing;
 pub mod router;
 pub mod transport;
 pub mod quic;
+pub mod nat;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GHLO {
