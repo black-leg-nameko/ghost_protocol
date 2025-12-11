@@ -14,5 +14,6 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 quinn = "0.10"
 rustls = "0.21"
 rcgen = "0.11"
+futures-util = "0.3"
 
 
