@@ -1,4 +1,4 @@
-# Ghost: Ephemeral Network Persona (ENP) Protocol — Draft v0.1
+# Ghost: Ephemeral Network Persona (ENP) Protocol — Draft v0.2
 
 ## 0. 本文書の目的と用語
 
@@ -174,5 +174,82 @@ ok = (s1*G == t1 + c_*pk_old) and (s2*G == t2 + c_*pk_new)
 - Epoch 非同期時のローテ挙動
 - 匿名トークン発行モデル
 - パディング・メタデータ隠蔽
+ 
+## 14. 付録: ワイヤフォーマット/互換性（v0.2 追加）
 
+本付録は v0.2 で導入された型付きエンベロープ、能力ネゴシエーション、バージョニング方針、CBOR後方互換ポリシーを定義する。従来の GHLO/GACK は将来の改訂で置換される予定（後方互換のため当面併記）。
+
+### A. 型付きエンベロープ
+
+すべてのメッセージは以下のエンベロープで輸送される。CBORは決定論的CBORを使用し、Mapキーは `uint` を採用する。
+
+CDDL（抜粋。完全版は `docs/cddl/ghost-wire.cddl` を参照）:
+
+```cddl
+envelope = {
+  0: env_ver: uint,        ; エンベロープスキーマ版（初期1）
+  1: type_id: uint,        ; メッセージタイプID
+  2: msg_ver: uint,        ; 当該タイプのメッセージ版
+  3: msg_id: bstr .size 16,
+  4: flags: uint,
+  5: ts: uint,             ; ms since epoch
+  6: body: any,
+  ?7: auth: bstr,
+  * uint => any
+}
+```
+
+タイプID空間:
+- 0: 無効
+- 1..1023: コア予約（本仕様）
+- 1024..16383: 将来コア予約
+- 16384..32767: ベンダ/私用
+- 32768..65535: 実験/一時
+
+予約タイプID:
+- 1: Capabilities
+- 2: NegResult
+- 3: Error
+
+### B. 能力ネゴシエーション
+
+目的はプロトコル版、機能集合、タイプ別メッセージ版レンジの合意。双方が `Capabilities` を送信し、イニシエータが `NegResult` を返す。交差が空なら `Error(code=1)`。
+
+```cddl
+capabilities = {
+  0: proto_min: uint,                 ; major.minor を単一整数に符号化（例: major*1000+minor）
+  1: proto_max: uint,
+  2: features: [* uint],              ; 機能ID集合
+  3: types: { * uint => [uint, uint] }, ; type_id => [min_ver, max_ver]
+  ?4: params: { * uint => any },
+  * uint => any
+}
+
+neg_result = {
+  0: proto: uint,                     ; 合意プロトコル版
+  1: features: [* uint],              ; 合意機能集合
+  ?2: params: { * uint => any },
+  * uint => any
+}
+
+error = {
+  0: code: uint,                      ; 1=NegotiationFailed, 2=UnsupportedType, 3=VersionOutOfRange
+  ?1: msg: tstr,
+  * uint => any
+}
+```
+
+### C. バージョニング方針
+
+- 二層: プロトコル版（セッション/リンク全体: Major.Minor）と、タイプ別 `msg_ver`（非負整数）。
+- Minorは後方互換の追加のみ（任意フィールド追加、意味不変）。破壊的変更は Major。
+- 送信時は、相手が広告したレンジ内で可能な限り高い `msg_ver` を選ぶ。
+- 既定値は明記し、Minorで変更しない。削除はDeprecatedを経て次のMajorで実施。
+
+### D. CBORエンコーディング/後方互換
+
+- 決定論的CBOR必須。Mapキーは `uint`。未知キーは受信側で無視（ignore-unknown）。
+- 列挙の未知値は無視（must-understand を要する変更は Major）。
+- 型変更（int→tstr 等）は Major でのみ可。浮動小数は必要時のみ64-bit、NaNは正規化。
+- 時刻は `uint` のms固定。単位/エポックは変更不可。
 

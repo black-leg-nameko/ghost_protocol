@@ -1,0 +1,48 @@
+; Ghost Wire CDDL — v0.2
+; Deterministic CBOR required (RFC 8949 §4.2.1)
+
+; Envelope carrying all typed messages
+envelope = {
+  0: env_ver: uint,        ; envelope schema version (initially 1)
+  1: type_id: uint,        ; message type id
+  2: msg_ver: uint,        ; schema version for the given type_id
+  3: msg_id: bstr .size 16 ; 128-bit random/unique ID
+  4: flags: uint,          ; reserved bits
+  5: ts: uint,             ; ms since epoch (uint64)
+  6: body: any,            ; message body interpreted by (type_id, msg_ver)
+  ?7: auth: bstr,          ; signature/MAC/etc (future)
+  * uint => any            ; extensions (100+ recommended)
+}
+
+; Capability advertisement
+capabilities = {
+  0: proto_min: uint,                 ; protocol version encoded as major*1000+minor
+  1: proto_max: uint,
+  2: features: [* uint],              ; set of feature ids (intersection semantics)
+  3: types: { * uint => [uint, uint] }, ; per-type supported [min_ver, max_ver]
+  ?4: params: { * uint => any },      ; e.g. max_frame, preferred_record_size, etc
+  * uint => any
+}
+
+; Negotiation result
+neg_result = {
+  0: proto: uint,                     ; agreed protocol version (same encoding)
+  1: features: [* uint],              ; agreed feature set
+  ?2: params: { * uint => any },      ; agreed parameters (subset/overrides)
+  * uint => any
+}
+
+; Generic error
+error = {
+  0: code: uint,                      ; 1=NegotiationFailed, 2=UnsupportedType, 3=VersionOutOfRange
+  ?1: msg: tstr,
+  * uint => any
+}
+
+; Reserved type ids
+; 0: invalid
+; 1: Capabilities
+; 2: NegResult
+; 3: Error
+
+
